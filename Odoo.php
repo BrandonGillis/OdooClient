@@ -3,6 +3,7 @@
 /**
  * (c) Jacob Steringa <jacobsteringa@gmail.com>
  * (c) Mehdi Ghezal <mehdi.ghezal@gmail.com>
+ * (c) Brandon Gillis <brandon.gillis@epitech.eu>
  *
  * For the full copyright and license information, please view the LICENSE
  * file that was distributed with this source code.
@@ -28,6 +29,7 @@ use DateInterval;
  *
  * @author  Jacob Steringa <jacobsteringa@gmail.com>
  * @author  Mehdi Ghezal <mehdi.ghezal@gmail.com>
+ * @author  Brandon Gillis <brandon.gillis@epitech.eu>
  */
 class Odoo
 {
