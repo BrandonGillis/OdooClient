@@ -2,6 +2,7 @@
 
 /**
  * (c) Jacob Steringa <jacobsteringa@gmail.com>
+ * (c) Mehdi Ghezal <mehdi.ghezal@gmail.com>
  *
  * For the full copyright and license information, please view the LICENSE
  * file that was distributed with this source code.
@@ -9,8 +10,13 @@
 
 namespace Jsg\Odoo;
 
-use Zend\Http\Client as HttpClient;
 use Zend\XmlRpc\Client as XmlRpcClient;
+use Zend\XmlRpc\Request;
+use Zend\XmlRpc\Response;
+use Symfony\Component\OptionsResolver\OptionsResolver;
+use Psr\SimpleCache\CacheInterface;
+use Psr\Log\LoggerAwareTrait;
+use DateInterval;
 
 /**
  * Odoo is an PHP client for the xmlrpc api of Odoo, formerly known as OpenERP.
@@ -21,361 +27,577 @@ use Zend\XmlRpc\Client as XmlRpcClient;
  * and Xml libraries from ZF.
  *
  * @author  Jacob Steringa <jacobsteringa@gmail.com>
+ * @author  Mehdi Ghezal <mehdi.ghezal@gmail.com>
  */
 class Odoo
 {
-	/**
-	 * Host to connect to
-	 *
-	 * @var string
-	 */
-	protected $host;
+    use LoggerAwareTrait;
 
-	/**
-	 * Unique identifier for current user
-	 *
-	 * @var integer
-	 */
-	protected $uid;
+    /**
+     * Host to connect to
+     *
+     * @var string
+     */
+    protected $host;
 
-	/**
-	 * Current users username
-	 *
-	 * @var string
-	 */
-	protected $user;
+    /**
+     * Unique identifier for current user
+     *
+     * @var integer
+     */
+    protected $uid;
 
-	/**
-	 * Current database
-	 *
-	 * @var string
-	 */
-	protected $database;
+    /**
+     * Current users username
+     *
+     * @var string
+     */
+    protected $user;
 
-	/**
-	 * Password for current user
-	 *
-	 * @var string
-	 */
-	protected $password;
+    /**
+     * Current database
+     *
+     * @var string
+     */
+    protected $database;
 
-	/**
-	 * XmlRpc Client
-	 *
-	 * @var XmlRpcClient
-	 */
-	protected $client;
+    /**
+     * Password for current user
+     *
+     * @var string
+     */
+    protected $password;
 
-	/**
-	 * XmlRpc endpoint
-	 *
-	 * @var string
-	 */
-	protected $path;
+    /**
+     * XmlRpc Clients
+     *
+     * @var XmlRpcClient[]
+     */
+    protected $clients;
 
-	/**
-	 * Optional custom http client to initialize the XmlRpcClient with
-	 *
-	 * @var HttpClient
-	 */
-	protected $httpClient;
+    /**
+     * XmlRpc Client
+     *
+     * @var XmlRpcClient
+     */
+    protected $lastClient;
 
-	/**
-	 * Odoo constructor
-	 *
-	 * @param string     $host       The url
-	 * @param string     $database   The database to log into
-	 * @param string     $user       The username
-	 * @param string     $password   Password of the user
-	 * @param HttpClient $httpClient An optional custom http client to initialize the XmlRpcClient with
-	 */
-	public function __construct($host, $database, $user, $password, HttpClient $httpClient = null)
-	{
-		$this->host = $host;
-		$this->database = $database;
-		$this->user = $user;
-		$this->password = $password;
-		$this->httpClient = $httpClient;
-	}
+    /**
+     * Optional: A callable return a custom Zend\Http\Client to initialize the XmlRpcClient with
+     *
+     * @var callable
+     */
+    protected $httpClientProvider;
 
-	/**
-	 * Get version
-	 *
-	 * @return array Odoo version
-	 */
-	public function version()
-	{
-		$response = $this->getClient('common')->call('version');
+    /**
+     * Default options for Odoo PHP Clients
+     *
+     * @var array
+     */
+    protected $defaultOptions;
 
-		return $response;
-	}
+    /**
+     * @var CacheInterface
+     */
+    protected $cache;
 
-	/**
-	 * Get timezone
-	 *
-	 * @return string Current timezone
-	 */
-	public function timezone()
-	{
-		$params = array(
-			$this->database,
-			$this->user,
-			$this->password
-		);
+    /**
+     * @var bool
+     */
+    protected $cacheActive = false;
 
-		return $this->getClient('common')->call('timezone_get', $params);
-	}
+    /**
+     * @var null|int|\DateInterval
+     */
+    protected $cacheTTL = null;
 
-	/**
-	 * Search models
-	 *
-	 * @param string  $model  Model
-	 * @param array   $data   Array of criteria
-	 * @param integer $offset Offset
-	 * @param integer $limit  Max results
-	 *
-	 * @return array Array of model id's
-	 */
-	public function search($model, $data, $offset = 0, $limit = 100)
-	{
-		$params = $this->buildParams(array(
-			$model,
-			'search',
-			$data,
-			$offset,
-			$limit
-		));
+    /**
+     * Odoo constructor
+     *
+     * @param string $host The url
+     * @param string $database The database to log into
+     * @param string $user The username
+     * @param string $password Password of the user
+     * @param callable $httpClientProvider Optional: A callable return a custom Zend\Http\Client to initialize the XmlRpcClient with
+     */
+    public function __construct($host, $database, $user, $password, callable $httpClientProvider = null)
+    {
+        $this->host = $host;
+        $this->database = $database;
+        $this->user = $user;
+        $this->password = $password;
+        $this->httpClientProvider = $httpClientProvider;
+        $this->clients = array();
 
-		$response = $this->getClient('object')->call('execute', $params);
+        $this->defaultOptions = array(
+            'offset' => 0,
+            'limit' => 100,
+            'order' => 'name ASC',
+            'fields' => array(),
+            'context' => array(),
+        );
+    }
 
-		return $response;
-	}
+    /**
+     * @param CacheInterface $cache
+     * @return $this
+     */
+    public function setCache(CacheInterface $cache)
+    {
+        $this->cache = $cache;
 
-	/**
-	 * Create model
-	 *
-	 * @param string $model Model
-	 * @param array  $data  Array of fields with data (format: ['field' => 'value'])
-	 *
-	 * @return integer Created model id
-	 */
-	public function create($model, $data)
-	{
-		$params = $this->buildParams(array(
-			$model,
-			'create',
-			$data
-		));
+        return $this;
+    }
 
-		$response = $this->getClient('object')->call('execute', $params);
+    /**
+     * @param null|int|DateInterval $ttl
+     * @return $this
+     */
+    public function withCache($ttl = null)
+    {
+        if (! $this->cache) {
+            $this->debug('The cache cannot be acivated as no cache component has been registered.');
 
-		return $response;
-	}
+            return $this;
+        }
 
-	/**
-	 * Read model(s)
-	 *
-	 * @param string $model  Model
-	 * @param array  $ids    Array of model id's
-	 * @param array  $fields Index array of fields to fetch, an empty array fetches all fields
-	 *
-	 * @return array An array of models
-	 */
-	public function read($model, $ids, $fields = array())
-	{
-		$params = $this->buildParams(array(
-			$model,
-			'read',
-			$ids,
-			$fields
-		));
+        $this->cacheActive = true;
+        $this->cacheTTL = $ttl;
 
-		$response = $this->getClient('object')->call('execute', $params);
+        return $this;
+    }
 
-		return $response;
-	}
+    /**
+     * Configure default options of the Odoo PHP Client
+     *
+     * @param array $options
+     * @return $this
+     */
+    public function configureDefaultsOptions(array $options)
+    {
+        $this->debug('Configure defaults options', $options);
+        $this->defaultOptions = $this->resolveOptions($options);
 
-	/**
-	 * Update model(s)
-	 *
-	 * @param string $model  Model
-	 * @param array  $ids    Array of model id's
-	 * @param array  $fields A associative array (format: ['field' => 'value'])
-	 *
-	 * @return array
-	 */
-	public function write($model, $ids, $fields)
-	{
-		$params = $this->buildParams(array(
-			$model,
-			'write',
-			$ids,
-			$fields
-		));
+        return $this;
+    }
 
-		$response = $this->getClient('object')->call('execute', $params);
+    /**
+     * Get version
+     *
+     * @return array Odoo version
+     */
+    public function version()
+    {
+        return $this->getClient('common')->call('version');
+    }
 
-		return $response;
-	}
+    /**
+     * Search models
+     *
+     * @param string $model Model
+     * @param array $domainFilter Array of criteria @see https://www.odoo.com/documentation/10.0/reference/orm.html#domains
+     * @param array $options Array of options
+     *
+     * @return array Array of model id's
+     */
+    public function search($model, $domainFilter, $options = array())
+    {
+        $options = $this->resolveOptions($options);
 
-	/**
-	 * Unlink model(s)
-	 *
-	 * @param string $model Model
-	 * @param array  $ids   Array of model id's
-	 *
-	 * @return boolean True is successful
-	 */
-	public function unlink($model, $ids)
-	{
-		$params = $this->buildParams(array(
-			$model,
-			'unlink',
-			$ids
-		));
+        $params = $this->buildParams(array(
+            $model,
+            'search',
+            $domainFilter,
+            $options['offset'],
+            $options['limit'],
+            $options['order'],
+            $options['context'],
+        ));
 
-		return $this->getClient('object')->call('execute', $params);
-	}
+        return $this->_searchOrRead($model, $params);
+    }
 
-	/**
-	 * Get report for model
-	 *
-	 * @param string $model Model
-	 * @param array  $ids   Array of id's, for this method it should typically be an array with one id
-	 * @param string $type  Report type
-	 *
-	 * @return mixed A report file
-	 */
-	public function getReport($model, $ids, $type = 'qweb-pdf')
-	{
-		$params = $this->buildParams(array(
-			$model,
-			$ids,
-			array(
-				'model' => $model,
-				'id' => $ids[0],
-				'report_type' => $type
-			)
-		));
+    /**
+     * Search and read models
+     *
+     * @param string $model Model
+     * @param array $domainFilter Array of criteria @see https://www.odoo.com/documentation/10.0/reference/orm.html#domains
+     * @param array $options Array of options
+     *
+     * @return array An array of models
+     */
+    public function searchRead($model, $domainFilter, $options = array())
+    {
+        $options = $this->resolveOptions($options);
 
-		$client = $this->getClient('report');
+        $params = $this->buildParams([
+            $model,
+            'search_read',
+            $domainFilter,
+            $options['fields'],
+            $options['offset'],
+            $options['limit'],
+            $options['order'],
+            $options['context'],
+        ]);
 
-		$reportId = $client->call('report', $params);
+        return $this->_searchOrRead($model, $params);
+    }
 
-		$state = false;
+    /**
+     * Search and count models
+     *
+     * @param string $model Model
+     * @param array $domainFilter Array of criteria @see https://www.odoo.com/documentation/10.0/reference/orm.html#domains
+     * @param array $options Array of options
+     *
+     * @return array An array of models
+     */
+    public function searchCount($model, $domainFilter, $options = array())
+    {
+        $options = $this->resolveOptions($options);
 
-		while (!$state) {
-			$report = $client->call(
-				'report_get',
-				$this->buildParams(array($reportId))
-			);
+        $params = $this->buildParams([
+            $model,
+            'search_count',
+            $domainFilter,
+            $options['fields'],
+            $options['offset'],
+            $options['limit'],
+            $options['order'],
+            $options['context'],
+        ]);
 
-			$state = $report['state'];
+        return $this->_searchOrRead($model, $params);
+    }
 
-			if (!$state) {
-				sleep(1);
-			}
-		}
+    /**
+     * Read model(s)
+     *
+     * @param string $model Model
+     * @param array $ids Array of model id's
+     * @param array $options Array of options
+     *
+     * @return array An array of models
+     */
+    public function read($model, $ids, $options = [])
+    {
+        $options = $this->resolveOptions($options);
 
-		return base64_decode($report['result']);
-	}
+        $params = $this->buildParams([
+            $model,
+            'read',
+            $ids,
+            $options['fields'],
+            $options['context'],
+        ]);
 
-	/**
-	 * Return last request
-	 *
-	 * @return string
-	 */
-	public function getLastRequest()
-	{
-		return $this->getClient()->getLastRequest();
-	}
+        return $this->_searchOrRead($model, $params);
+    }
 
-	/**
-	 * Return last response
-	 *
-	 * @return string
-	 */
-	public function getLastResponse()
-	{
-		return $this->getClient()->getLastResponse();
-	}
+    /**
+     * Create model
+     *
+     * @param string $model Model
+     * @param array  $data  Array of fields with data (format: ['field' => 'value'])
+     *
+     * @return integer Created model id
+     */
+    public function create($model, $data)
+    {
+        $options = $this->resolveOptions([]);
 
-	/**
-	 * Set custom http client
-	 *
-	 * @param HttpClient $httpClient
-	 */
-	public function setHttpClient(HttpClient $httpClient)
-	{
-		$this->httpClient = $httpClient;
-	}
+        $params = $this->buildParams([
+            $model,
+            'create',
+            $data,
+            $options['context'],
+        ]);
 
-	/**
-	 * Build parameters
-	 *
-	 * @param array  $params Array of params to append to the basic params
-	 *
-	 * @return array
-	 */
-	protected function buildParams(array $params)
-	{
-		return array_merge(array(
-			$this->database,
-			$this->uid(),
-			$this->password
-		), $params);
-	}
+        $this->debug(sprintf('Create model %s', $model), $params);
 
-	/**
-	 * Get XmlRpc Client
-	 *
-	 * This method returns an XmlRpc Client for the requested endpoint.
-	 * If no endpoint is specified or if a client for the requested endpoint is
-	 * already initialized, the last used client will be returned.
-	 *
-	 * @param null|string $path The api endpoint
-	 *
-	 * @return XmlRpcClient
-	 */
-	protected function getClient($path = null)
-	{
-		if ($path === null) {
-			return $this->client;
-		}
+        $response = $this->getClient('object')->call('execute', $params);
 
-		if ($this->path === $path) {
-			return $this->client;
-		}
+        return $response;
+    }
 
-		$this->path = $path;
+    /**
+     * Update model(s)
+     *
+     * @param string $model  Model
+     * @param array  $ids    Array of model id's
+     * @param array  $fields A associative array (format: ['field' => 'value'])
+     *
+     * @return array
+     */
+    public function write($model, $ids, $fields)
+    {
+        $options = $this->resolveOptions([]);
 
-		$this->client = new XmlRpcClient($this->host . '/' . $path, $this->httpClient);
+        $params = $this->buildParams([
+            $model,
+            'write',
+            $ids,
+            $fields,
+            $options['context'],
+        ]);
 
-		// The introspection done by the Zend XmlRpc client is probably specific
-		// to Zend XmlRpc servers. To prevent polution of the Odoo logs with errors
-		// resulting from this introspection calls we disable it.
-		$this->client->setSkipSystemLookup(true);
+        $this->debug(sprintf('Write model %s', $model), $params);
 
-		return $this->client;
-	}
+        $response = $this->getClient('object')->call('execute', $params);
 
-	/**
-	 * Get uid
-	 *
-	 * @return int $uid
-	 */
-	protected function uid()
-	{
-		if ($this->uid === null) {
-			$client = $this->getClient('common');
+        return $response;
+    }
 
-			$this->uid = $client->call('login', array(
-				$this->database,
-				$this->user,
-				$this->password
-			));
-		}
+    /**
+     * Unlink model(s)
+     *
+     * @param string $model Model
+     * @param array  $ids   Array of model id's
+     *
+     * @return boolean True is successful
+     */
+    public function unlink($model, $ids)
+    {
+        $options = $this->resolveOptions([]);
 
-		return $this->uid;
-	}
+        $params = $this->buildParams([
+            $model,
+            'unlink',
+            $ids,
+            $options['context'],
+        ]);
+
+        $this->debug(sprintf('Unlink model %s', $model), $params);
+
+        return $this->getClient('object')->call('execute', $params);
+    }
+
+    /**
+     * Get a report in PDF Format ; an encoded base64 string is return or false
+     *
+     * @param string $report Report name, for example account.report_invoice
+     * @param array $ids Array of model id's related to the report, for this method it should typically be an array with one id
+     *
+     * @return string|false
+     */
+    public function getReport($report, array $ids)
+    {
+        $client = $this->getClient('report');
+        $params = $this->buildParams([$report, $ids]);
+        $response = $client->call('render_report', $params);
+
+        if ($response && isset($response['state']) && $response['state']) {
+            return base64_decode($response['result']);
+        }
+
+        return false;
+    }
+
+    /**
+     * Return last XML-RPC Client
+     *
+     * @return XmlRpcClient
+     */
+    public function getLastXmlRpcClient()
+    {
+        return $this->lastClient;
+    }
+
+    /**
+     * Return last request
+     *
+     * @return Request
+     */
+    public function getLastRequest()
+    {
+        return $this->lastClient ? $this->lastClient->getLastRequest() : null;
+    }
+
+    /**
+     * Return last response
+     *
+     * @return Response
+     */
+    public function getLastResponse()
+    {
+        return $this->lastClient ? $this->lastClient->getLastResponse() : null;
+    }
+
+    /**
+     * Set a callable return a custom Zend\Http\Client to initialize the XmlRpcClient with
+     *
+     * @param callable $httpClientProvider
+     * @return $this
+     */
+    public function setHttpClientProvider(callable $httpClientProvider)
+    {
+        $this->httpClientProvider = $httpClientProvider;
+
+        return $this;
+    }
+
+    /**
+     * @param $model
+     * @param array $params
+     * @return mixed
+     */
+    protected function _searchOrRead($model, array $params)
+    {
+        // Cache is ON
+        if ($this->cacheActive) {
+            $key = $this->calculateCacheKey($params);
+            $this->debug(sprintf('Cache lookup for %s with key %s', $model, $key), $params);
+
+            // Cache match, we use cache
+            if ($this->cache->has($key)) {
+                $this->debug(sprintf('Cache match for model %s with key %s', $model, $key), $params);
+
+                return $this->cache->get($key);
+            }
+
+            // Cache didn't match, we request Odoo
+            $this->debug(sprintf('Cache not match for model %s with key %s, call Odoo API', $model, $key), $params);
+            $results = $this->getClient('object')->call('execute', $params);
+
+            // Save results in cache, and reset cache settings
+            $this->cache->set($key, $results, $this->cacheTTL);
+            $this->cacheActive = false;
+            $this->cacheTTL = null;
+
+            // Return the results
+            return $results;
+        }
+
+        // Cache is OFF
+        $this->debug(sprintf('Cache not use, call Odoo API for model %s', $model), $params);
+
+        return $this->getClient('object')->call('execute', $params);
+    }
+
+    /**
+     * Build parameters
+     *
+     * @param array  $params Array of params to append to the basic params
+     *
+     * @return array
+     */
+    protected function buildParams(array $params)
+    {
+        return array_merge([
+            $this->database,
+            $this->uid(),
+            $this->password
+        ], $params);
+    }
+
+    /**
+     * Get XmlRpc Client
+     *
+     * This method returns an XmlRpc Client for the requested endpoint.
+     * If no endpoint is specified or if a client for the requested endpoint is
+     * already initialized, the last used client will be returned.
+     *
+     * @param string $path The api endpoint
+     *
+     * @return XmlRpcClient
+     */
+    protected function getClient($path)
+    {
+        if (! isset($this->clients[$path])) {
+            $httpClient = $this->httpClientProvider ? call_user_func($this->httpClientProvider) : null;
+
+            $this->clients[$path] = new XmlRpcClient($this->host . '/' . $path, $httpClient);
+
+            // The introspection done by the Zend XmlRpc client is probably specific
+            // to Zend XmlRpc servers. To prevent polution of the Odoo logs with errors
+            // resulting from this introspection calls we disable it.
+            $this->clients[$path]->setSkipSystemLookup(true);
+        }
+
+        $this->lastClient = $this->clients[$path];
+
+        return $this->clients[$path];
+    }
+
+    /**
+     * Get uid
+     *
+     * @return int $uid
+     */
+    protected function uid()
+    {
+        if ($this->uid === null) {
+            $client = $this->getClient('common');
+
+            $this->uid = $client->call('login', [
+                $this->database,
+                $this->user,
+                $this->password
+            ]);
+        }
+
+        return $this->uid;
+    }
+
+    /**
+     * @param array $options
+     * @return array
+     */
+    protected function resolveOptions(array $options)
+    {
+        $optionsResolver = new OptionsResolver();
+        $optionsResolver
+            ->setDefined('offset')
+            ->setDefined('limit')
+            ->setDefined('order')
+            ->setDefined('fields')
+            ->setDefined('context')
+
+            ->setAllowedTypes('offset', 'int')
+            ->setAllowedTypes('limit', 'int')
+            ->setAllowedTypes('order', 'string')
+            ->setAllowedTypes('fields', 'array')
+            ->setAllowedTypes('context', 'array')
+
+            ->setAllowedValues('fields', function (array $fields) {
+                foreach($fields as $field) {
+                    if (! is_string($field)) {
+                        return false;
+                    }
+                }
+
+                return true;
+            })
+
+            ->setDefaults($this->defaultOptions)
+        ;
+
+        return $optionsResolver->resolve($options);
+    }
+
+    /**
+     * @param string $message
+     * @param array $context
+     * @return $this
+     */
+    protected function debug($message, array $context = [])
+    {
+        if ($this->logger) {
+            $this->logger->debug($message, $context);
+        }
+
+        return $this;
+    }
+
+    /**
+     * @param array $params
+     * @return string
+     */
+    protected function calculateCacheKey(array $params)
+    {
+        array_multisort($params);
+
+        return md5(json_encode($params));
+    }
 }
